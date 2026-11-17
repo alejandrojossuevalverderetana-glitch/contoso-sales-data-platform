@@ -172,6 +172,146 @@ def revisar_integridad(tablas, fact):
         estado = "OK" if not huerfanas else f"FALTAN en la dimensión: {huerfanas[:10]}"
         print(f"FactSales.{col_fact} -> {tabla_dim}.{col_dim}: {estado}")
 
+# ----------------------------------------------------------------------------
+# ANÁLISIS ADICIONAL: GRANULARIDAD Y CALIDAD RELACIONAL
+# ----------------------------------------------------------------------------
+
+def analizar_granularidad(fact):
+    """
+    Determina si OrderID identifica un registro único y examina
+    posibles repeticiones en las dimensiones de la tabla de hechos.
+    """
+    print("=" * 78)
+    print("ANÁLISIS DE GRANULARIDAD: FactSales")
+    print("=" * 78)
+
+    total = len(fact)
+    unicos = fact["OrderID"].nunique()
+    repetidos = fact["OrderID"].duplicated().sum()
+
+    print(f"Total de registros: {total:,}")
+    print(f"OrderID distintos: {unicos:,}")
+    print(f"OrderID repetidos: {repetidos:,}")
+    print(f"¿OrderID es único?: {'SI' if repetidos == 0 else 'NO'}")
+
+    if repetidos > 0:
+        frecuencia = fact["OrderID"].value_counts()
+        print("\nPedidos con mayor cantidad de registros:")
+        print(frecuencia.head(10).to_string())
+
+    # Comprobar combinaciones de pedido y producto
+    columnas = ["OrderID", "ProductKey"]
+    duplicados = fact.duplicated(subset=columnas).sum()
+
+    print(f"\nCombinaciones OrderID-ProductKey repetidas: {duplicados:,}")
+
+    # Comprobar combinaciones completas de dimensiones
+    dimensiones = [
+        "OrderID", "DateKey", "channelKey",
+        "StoreKey", "ProductKey", "PromotionKey"
+    ]
+
+    duplicados_dim = fact.duplicated(subset=dimensiones).sum()
+
+    print(
+        "Combinaciones completas de pedido y dimensiones repetidas:",
+        f"{duplicados_dim:,}"
+    )
+
+
+def revisar_integridad_completa(tablas, fact):
+    """
+    Verifica las siete relaciones entre las tablas de dimensiones
+    y FactSales, incluyendo las relaciones internas.
+    """
+    print("=" * 78)
+    print("ANÁLISIS DE INTEGRIDAD REFERENCIAL COMPLETA")
+    print("=" * 78)
+
+    relaciones = [
+        ("FactSales", "channelKey", "DimChannel", "ChannelKey"),
+        ("FactSales", "StoreKey", "DimStores", "StoreKey"),
+        ("FactSales", "ProductKey", "DimProduct", "ProductKey"),
+        ("FactSales", "PromotionKey", "DimPromotion", "PromotionKey"),
+        ("DimStores", "GeographyKey", "DimGeography", "GeographyKey"),
+        ("DimProduct", "ProductSubcategoryKey",
+         "DimProductSubCategory", "ProductSubcategoryKey"),
+        ("DimProductSubCategory", "ProductCategoryKey",
+         "DimProductCategory", "ProductCategoryKey"),
+    ]
+
+    for origen, col_origen, destino, col_destino in relaciones:
+
+        df_origen = fact if origen == "FactSales" else tablas[origen]
+        df_destino = tablas[destino]
+
+        llaves_origen = set(df_origen[col_origen].dropna().unique())
+        llaves_destino = set(df_destino[col_destino].dropna().unique())
+
+        huerfanas = llaves_origen - llaves_destino
+
+        estado = "OK" if not huerfanas else f"ERROR: {len(huerfanas)}"
+
+        print(
+            f"{origen}.{col_origen} -> "
+            f"{destino}.{col_destino}: {estado}"
+        )
+
+        if huerfanas:
+            print("  Ejemplos:", list(huerfanas)[:10])
+
+
+def revisar_consistencia(fact):
+    """
+    Examina posibles inconsistencias entre cantidades,
+    devoluciones, precios e ingresos.
+    """
+    print("=" * 78)
+    print("ANÁLISIS DE CONSISTENCIA DE FactSales")
+    print("=" * 78)
+
+    # Valores negativos o cero en cantidades
+    for col in ["SalesQuantity", "ReturnQuantity", "Cantidad_total"]:
+        negativos = (fact[col] < 0).sum()
+        ceros = (fact[col] == 0).sum()
+
+        print(f"\n{col}:")
+        print(f"  Valores negativos: {negativos:,}")
+        print(f"  Valores iguales a cero: {ceros:,}")
+
+    # Consistencia entre devolución y cantidad devuelta
+    devolucion_incoherente = (
+        ((fact["ReturnQuantity"] > 0) & (fact["Devolución"] != "SI")) |
+        ((fact["ReturnQuantity"] == 0) & (fact["Devolución"] != "NO"))
+    ).sum()
+
+    print(
+        "\nInconsistencias Devolución vs ReturnQuantity:",
+        f"{devolucion_incoherente:,}"
+    )
+
+    # Clasificación de devoluciones
+    print("\nRelación entre devolución y tipo:")
+    print(
+        pd.crosstab(
+            fact["Devolución"],
+            fact["Devolución_type"]
+        ).to_string()
+    )
+
+    # Revisar si los ingresos corresponden a precio por cantidad
+    ingresos_calculados = (
+        fact["Precio_unitario"] * fact["Cantidad_total"]
+    )
+
+    diferencias = (
+        fact["Ingresos"] - ingresos_calculados
+    ).abs()
+
+    print("\nIngresos vs Precio_unitario * Cantidad_total:")
+    print(f"  Diferencias mayores a 0.01: {(diferencias > 0.01).sum():,}")
+    print(f"  Diferencia máxima: {diferencias.max():.4f}")
+
 
 # ----------------------------------------------------------------------------
 # PROGRAMA PRINCIPAL
@@ -195,6 +335,21 @@ def main():
     fechas = tablas["FactSales"]["DateKey"]
     print(f"\nRango de fechas de FactSales: {fechas.min().date()} a {fechas.max().date()}")
 
+    # 5) Análisis de granularidad
+    analizar_granularidad(tablas["FactSales"])
+
+    # 6) Integridad referencial completa
+    revisar_integridad_completa(tablas, tablas["FactSales"])
+
+    # 7) Consistencia de los datos
+    revisar_consistencia(tablas["FactSales"])
+
+
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
