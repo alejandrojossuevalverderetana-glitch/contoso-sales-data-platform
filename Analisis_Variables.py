@@ -13,7 +13,9 @@ Este script realiza:
     1. Preparación y verificación de las tres variables.
     2. Estadísticos: media, mediana, varianza, momentos, asimetría y curtosis.
     3. Estimación de la función de densidad (histograma y KDE).
-    4. Ajuste de distribuciones teóricas candidatas.
+    4. Ajuste de distribuciones teóricas candidatas (con sus parámetros).
+    5. Dependencia entre Cantidad_total y Precio_unitario, y comprobación de que
+       E[Ingresos] = E[Cantidad_total * Precio_unitario] (correlación).
 
 Los datos se leen desde la base de datos PostgreSQL contoso_sales
 (ver la carpeta database/ del repositorio para crearla y cargarla).
@@ -273,6 +275,7 @@ def ajustar_distribuciones(muestra):
     for var in VARIABLES:
         x = muestra[var].to_numpy(dtype=float)
         filas = []
+        parametros_ajustados = {}
         for nombre, dist in DISTRIBUCIONES.items():
             try:
                 # Las variables son positivas: para Gamma y Log-normal se fija la
@@ -285,6 +288,7 @@ def ajustar_distribuciones(muestra):
                 # Log-verosimilitud: mayor (menos negativa) es mejor
                 logver = np.sum(dist.logpdf(x, *parametros))
                 filas.append({"Distribución": nombre, "KS": ks, "Log-verosimilitud": logver})
+                parametros_ajustados[nombre] = (dist, parametros)
             except Exception as error:
                 print(f"  No se pudo ajustar {nombre} a {var}: {error}")
 
@@ -292,6 +296,107 @@ def ajustar_distribuciones(muestra):
         print(f"\n{var}:")
         print(tabla.to_string(index=False, float_format=lambda v: f"{v:,.4f}"))
         print(f"  Mejor ajuste según KS: {tabla.loc[0, 'Distribución']}")
+
+        # Parámetros de cada distribución: son los que definen la expresión de
+        # la función de densidad f(x) que se reporta.
+        print("  Parámetros ajustados:")
+        for nombre, (dist, parametros) in parametros_ajustados.items():
+            etiquetas = (dist.shapes.split(", ") if dist.shapes else []) + ["loc", "scale"]
+            texto = ", ".join(f"{e} = {v:,.6g}" for e, v in zip(etiquetas, parametros))
+            print(f"    {nombre}: {texto}")
+
+
+# ----------------------------------------------------------------------------
+# 5. DEPENDENCIA ENTRE VARIABLES
+# ----------------------------------------------------------------------------
+def analizar_dependencia(datos, muestra):
+    """
+    Analiza la relación entre Q = Cantidad_total y P = Precio_unitario.
+
+    Si Q y P fueran independientes, se cumpliría  E[Q*P] = E[Q] * E[P].
+    La diferencia entre ambos lados es la covarianza:
+        Cov(Q, P) = E[Q*P] - E[Q]*E[P]
+    Como Ingresos = Q * P, el valor esperado de Ingresos es la correlación
+    (en sentido de procesos estocásticos) R_QP = E[Q*P].
+    """
+    print("\n" + "=" * 78)
+    print("DEPENDENCIA ENTRE Cantidad_total (Q) Y Precio_unitario (P)")
+    print("=" * 78)
+
+    q = datos["Cantidad_total"].to_numpy(dtype=float)
+    p = datos["Precio_unitario"].to_numpy(dtype=float)
+    ingresos = datos["Ingresos"].to_numpy(dtype=float)
+
+    # ---- a) Comprobación pedida: E[Ingresos] = E[Q*P] (correlación) ----
+    e_q, e_p = np.mean(q), np.mean(p)
+    e_ingresos = np.mean(ingresos)
+    correlacion_qp = np.mean(q * p)          # R_QP = E[Q*P]
+    producto_medias = e_q * e_p              # E[Q]*E[P]
+    covarianza = correlacion_qp - producto_medias
+
+    print("\na) Valor esperado de Ingresos y correlación entre Q y P")
+    print(f"   E[Q]               = {e_q:,.4f}")
+    print(f"   E[P]               = {e_p:,.4f}")
+    print(f"   E[Ingresos]        = {e_ingresos:,.4f}")
+    print(f"   R_QP = E[Q*P]      = {correlacion_qp:,.4f}")
+    print(f"   |E[Ingresos] - E[Q*P]| = {abs(e_ingresos - correlacion_qp):.6f}  "
+          f"({'se cumple' if np.isclose(e_ingresos, correlacion_qp) else 'NO se cumple'})")
+
+    # ---- b) Comparación con el caso de independencia ----
+    print("\nb) Comparación con el caso independiente")
+    print(f"   E[Q]*E[P]          = {producto_medias:,.4f}")
+    print(f"   Cov(Q, P)          = E[Q*P] - E[Q]*E[P] = {covarianza:,.4f}")
+    print(f"   Diferencia relativa respecto a E[Q*P]: {covarianza / correlacion_qp:.2%}")
+
+    # ---- c) Coeficientes de correlación ----
+    pearson = stats.pearsonr(q, p)[0]        # relación lineal
+    spearman = stats.spearmanr(q, p)[0]      # relación monótona (por rangos)
+    print("\nc) Coeficientes de correlación")
+    print(f"   Pearson  (lineal)   = {pearson:.4f}")
+    print(f"   Spearman (monótona) = {spearman:.4f}")
+    print("   Nota: independencia implica Cov = 0, pero Cov = 0 no implica "
+          "independencia.")
+
+    # ---- d) Prueba de independencia chi-cuadrado sobre una tabla de contingencia ----
+    # Se agrupa cada variable en deciles para formar una tabla de contingencia.
+    q_bins = pd.qcut(datos["Cantidad_total"], q=10, duplicates="drop")
+    p_bins = pd.qcut(datos["Precio_unitario"], q=10, duplicates="drop")
+    tabla = pd.crosstab(q_bins, p_bins)
+    chi2, p_valor, grados, _ = stats.chi2_contingency(tabla)
+    n = tabla.to_numpy().sum()
+    # V de Cramér: mide la fuerza de la asociación (0 = ninguna, 1 = total).
+    # Con millones de datos el p-valor es siempre ínfimo, por eso se reporta V.
+    v_cramer = np.sqrt(chi2 / (n * (min(tabla.shape) - 1)))
+    print("\nd) Prueba chi-cuadrado de independencia (variables agrupadas en deciles)")
+    print(f"   chi2 = {chi2:,.1f} | grados de libertad = {grados} | p-valor = {p_valor:.3g}")
+    print(f"   V de Cramér = {v_cramer:.4f}")
+
+    # ---- e) Cómo cambia el precio según la cantidad ----
+    por_grupo = datos.groupby(q_bins, observed=True)["Precio_unitario"].agg(["count", "mean", "median"])
+    print("\ne) Precio_unitario según el decil de Cantidad_total")
+    print(por_grupo.to_string(float_format=lambda v: f"{v:,.2f}"))
+
+    # ---- f) Gráfico de dispersión (muestra) ----
+    CARPETA_RESULTADOS.mkdir(exist_ok=True)
+    fig, eje = plt.subplots(figsize=(7, 5))
+    eje.hexbin(muestra["Cantidad_total"], muestra["Precio_unitario"],
+               gridsize=50, bins="log", xscale="log", yscale="log")
+    eje.set_title("Cantidad_total vs Precio_unitario (muestra, escala log)")
+    eje.set_xlabel("Cantidad_total")
+    eje.set_ylabel("Precio_unitario")
+    fig.tight_layout()
+    ruta = CARPETA_RESULTADOS / "dispersion_cantidad_precio.png"
+    fig.savefig(ruta, dpi=150)
+    plt.close(fig)
+    print(f"\nFigura guardada: {ruta}")
+
+    # Se guarda un CSV con los resultados numéricos para el reporte
+    pd.DataFrame({
+        "E[Q]": [e_q], "E[P]": [e_p], "E[Ingresos]": [e_ingresos],
+        "R_QP=E[QP]": [correlacion_qp], "E[Q]E[P]": [producto_medias],
+        "Cov(Q,P)": [covarianza], "Pearson": [pearson], "Spearman": [spearman],
+        "chi2": [chi2], "V_Cramer": [v_cramer],
+    }).to_csv(CARPETA_RESULTADOS / "dependencia.csv", index=False, float_format="%.6f")
 
 
 # ----------------------------------------------------------------------------
@@ -322,6 +427,9 @@ def main():
 
     # 4) Ajuste de distribuciones teóricas
     ajustar_distribuciones(muestra)
+
+    # 5) Dependencia entre Cantidad_total y Precio_unitario
+    analizar_dependencia(datos, muestra)
 
 
 if __name__ == "__main__":
