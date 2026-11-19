@@ -12,7 +12,7 @@ Variables analizadas (tabla FactSales):
 Este script realiza:
     1. Preparación y verificación de las tres variables.
     2. Estadísticos: media, mediana, varianza, momentos, asimetría y curtosis.
-    3. Estimación de la función de densidad (histograma y KDE).
+    3. Estimación de la función de densidad (histograma, KDE y ajuste teórico).
     4. Ajuste de distribuciones teóricas candidatas (con sus parámetros).
     5. Dependencia entre Cantidad_total y Precio_unitario, y comprobación de que
        E[Ingresos] = E[Cantidad_total * Precio_unitario] (correlación).
@@ -37,6 +37,7 @@ import matplotlib
 
 matplotlib.use("Agg")  # genera las figuras como archivos, sin abrir ventanas
 import matplotlib.pyplot as plt
+from matplotlib.colors import TwoSlopeNorm
 from scipy import stats
 from sqlalchemy import create_engine, text, URL
 
@@ -61,6 +62,26 @@ VARIABLES = ["Cantidad_total", "Precio_unitario", "Ingresos"]
 TAMANO_MUESTRA = 50_000
 SEMILLA = 42  # semilla fija para obtener siempre los mismos resultados
 
+# Colores y nombres usados en todas las gráficas (un color fijo por variable)
+COLORES = {
+    "Cantidad_total": "#2E6F9E",
+    "Precio_unitario": "#3B8E5A",
+    "Ingresos": "#D9822B",
+}
+COLOR_KDE = "#1B1B1B"
+COLOR_AJUSTE = "#C0392B"
+ETIQUETAS = {
+    "Cantidad_total": "Cantidad total (unidades)",
+    "Precio_unitario": "Precio unitario",
+    "Ingresos": "Ingresos",
+}
+# Frases con su artículo, para que los títulos queden bien redactados
+TITULOS = {
+    "Cantidad_total": "de la cantidad total",
+    "Precio_unitario": "del precio unitario",
+    "Ingresos": "de los ingresos",
+}
+
 # Distribuciones teóricas candidatas para el ajuste
 DISTRIBUCIONES = {
     "Normal": stats.norm,
@@ -68,6 +89,28 @@ DISTRIBUCIONES = {
     "Log-normal": stats.lognorm,
     "Gamma": stats.gamma,
 }
+
+
+# ----------------------------------------------------------------------------
+# ESTILO DE LAS GRÁFICAS
+# ----------------------------------------------------------------------------
+def configurar_estilo():
+    """Define un estilo limpio y legible para todas las figuras del reporte."""
+    plt.rcParams.update({
+        "figure.dpi": 100,
+        "savefig.dpi": 200,
+        "savefig.bbox": "tight",
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.titleweight": "bold",
+        "axes.labelsize": 11,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "legend.frameon": False,
+        "legend.fontsize": 10,
+    })
 
 
 # ----------------------------------------------------------------------------
@@ -94,8 +137,12 @@ def cargar_datos(motor):
     """
     # Los nombres van entre comillas dobles porque en PostgreSQL conservan
     # las mayúsculas solo si se escriben así.
+    # ORDER BY garantiza siempre el mismo orden de filas: sin él, PostgreSQL puede
+    # entregarlas en otro orden y la muestra aleatoria (y los parámetros del ajuste)
+    # cambiarían de una corrida a otra.
     consulta = text(
-        'SELECT "Cantidad_total", "Precio_unitario", "Ingresos" FROM "FactSales"'
+        'SELECT "Cantidad_total", "Precio_unitario", "Ingresos" '
+        'FROM "FactSales" ORDER BY "OrderID"'
     )
     with motor.connect() as conexion:
         datos = pd.read_sql(consulta, conexion)
@@ -191,64 +238,108 @@ def reporte_estadisticos(datos):
 # ----------------------------------------------------------------------------
 # 3. FUNCIÓN DE DENSIDAD
 # ----------------------------------------------------------------------------
-def graficar_densidad(datos, muestra):
+def graficar_densidad(datos, muestra, ajustes):
     """
-    Estima la función de densidad de cada variable:
+    Grafica la estimación de la función de densidad de cada variable:
         - Histograma normalizado (área total = 1): aproxima la densidad.
-        - KDE (estimación por kernel gaussiano): versión suavizada de la densidad.
-    Para Cantidad_total, que es discreta, se grafica además su función de masa
-    de probabilidad (PMF) con las frecuencias relativas.
+        - KDE (estimación por kernel gaussiano): versión suavizada.
+        - Curva de la distribución teórica con mejor ajuste (ver ajustar_distribuciones).
+    Panel izquierdo: escala original, recortada al percentil 99 para ver el cuerpo
+    de la distribución. Panel derecho: logaritmo de la variable; si la forma resulta
+    simétrica, la variable original se parece a una log-normal.
+    Además se grafica la función de masa de probabilidad (PMF) de Cantidad_total,
+    que es una variable discreta.
     """
     CARPETA_RESULTADOS.mkdir(exist_ok=True)
 
     for var in VARIABLES:
-        x_completo = datos[var].to_numpy()
-        x_muestra = muestra[var].to_numpy()
+        x = datos[var].to_numpy(dtype=float)
+        x_muestra = muestra[var].to_numpy(dtype=float)
+        color = COLORES[var]
+        limite = np.percentile(x, 99)
 
-        fig, ejes = plt.subplots(1, 2, figsize=(12, 4.5))
+        fig, ejes = plt.subplots(1, 2, figsize=(13, 5))
 
-        # Izquierda: escala normal, recortada al percentil 99 para ver el cuerpo
-        # de la distribución (los valores extremos aplastan el gráfico).
-        limite = np.percentile(x_completo, 99)
-        ejes[0].hist(x_completo[x_completo <= limite], bins=60, density=True,
-                     alpha=0.6, label="Histograma (densidad)")
-        malla = np.linspace(x_muestra.min(), limite, 400)
-        kde = stats.gaussian_kde(x_muestra)
-        ejes[0].plot(malla, kde(malla), linewidth=2, label="KDE")
-        ejes[0].set_title(f"{var} (hasta el percentil 99)")
-        ejes[0].set_xlabel(var)
-        ejes[0].set_ylabel("Densidad")
-        ejes[0].legend()
+        # ---- Panel izquierdo: escala original ----
+        eje = ejes[0]
+        if var == "Cantidad_total":
+            # Variable entera: una barra por cada valor entero
+            bordes_hist = np.arange(np.floor(x.min()), limite + 2) - 0.5
+        else:
+            bordes_hist = np.linspace(x.min(), limite, 61)
+        conteos, bordes = np.histogram(x[x <= limite], bins=bordes_hist)
+        # Densidad calculada respecto al total de datos (no solo al recorte)
+        densidad = conteos / (len(x) * np.diff(bordes))
+        eje.bar(bordes[:-1], densidad, width=np.diff(bordes), align="edge",
+                color=color, alpha=0.55, label="Histograma")
 
-        # Derecha: logaritmo de la variable. Si la forma resulta simétrica,
-        # la variable original se parece a una log-normal.
-        log_x = np.log(x_completo)
-        ejes[1].hist(log_x, bins=60, density=True, alpha=0.6, label="Histograma")
-        malla_log = np.linspace(log_x.min(), log_x.max(), 400)
-        kde_log = stats.gaussian_kde(np.log(x_muestra))
-        ejes[1].plot(malla_log, kde_log(malla_log), linewidth=2, label="KDE")
-        ejes[1].set_title(f"log({var})")
-        ejes[1].set_xlabel(f"log({var})")
-        ejes[1].set_ylabel("Densidad")
-        ejes[1].legend()
+        malla = np.linspace(x.min(), limite, 500)
+        eje.plot(malla, stats.gaussian_kde(x_muestra)(malla), color=COLOR_KDE,
+                 linewidth=2, label="KDE")
+
+        nombre, dist, parametros = ajustes[var]
+        eje.plot(malla, dist.pdf(malla, *parametros), color=COLOR_AJUSTE,
+                 linewidth=2, linestyle="--", label=f"Ajuste {nombre}")
+
+        eje.set_ylim(0, densidad.max() * 1.25)  # evita que el ajuste se salga de la figura
+        eje.set_title(f"Densidad {TITULOS[var]}\n(hasta el percentil 99)")
+        eje.set_xlabel(ETIQUETAS[var])
+        eje.set_ylabel("Densidad de probabilidad")
+        eje.legend()
+
+        # ---- Panel derecho: escala logarítmica ----
+        eje = ejes[1]
+        log_x = np.log(x)
+        if var == "Cantidad_total":
+            # Variable entera: con intervalos de igual ancho en escala logarítmica
+            # quedarían intervalos sin ningún entero (huecos artificiales). Se usan
+            # intervalos cuyos bordes son enteros, de modo que todos contengan datos.
+            enteros = np.unique(np.floor(np.geomspace(x.min(), x.max() + 1, 30)).astype(int))
+            bordes_log = np.log(enteros - 0.5)
+        else:
+            bordes_log = 60
+        eje.hist(log_x, bins=bordes_log, density=True, color=color, alpha=0.55,
+                 label="Histograma")
+        if var != "Cantidad_total":
+            # Para la variable discreta la KDE genera picos artificiales, no se grafica
+            malla_log = np.linspace(log_x.min(), log_x.max(), 500)
+            eje.plot(malla_log, stats.gaussian_kde(np.log(x_muestra))(malla_log),
+                     color=COLOR_KDE, linewidth=2, label="KDE")
+        eje.set_title(f"Logaritmo {TITULOS[var]}")
+        eje.set_xlabel(f"log({ETIQUETAS[var].split(' (')[0]})")  # sin la unidad entre paréntesis
+        eje.set_ylabel("Densidad de probabilidad")
+        eje.legend()
 
         fig.tight_layout()
         ruta = CARPETA_RESULTADOS / f"densidad_{var}.png"
-        fig.savefig(ruta, dpi=150)
+        fig.savefig(ruta)
         plt.close(fig)
         print(f"Figura guardada: {ruta}")
 
-    # PMF de la variable discreta Cantidad_total (valores más frecuentes)
+    # ---- Función de masa de probabilidad de Cantidad_total ----
     pmf = datos["Cantidad_total"].value_counts(normalize=True).sort_index()
-    fig, eje = plt.subplots(figsize=(9, 4.5))
-    pmf_corta = pmf[pmf.index <= 100]
-    eje.bar(pmf_corta.index, pmf_corta.values)
-    eje.set_title("Función de masa de probabilidad de Cantidad_total (valores hasta 100)")
-    eje.set_xlabel("Cantidad_total")
-    eje.set_ylabel("P(X = x)")
+    corta = pmf[pmf.index <= 40]
+    fig, eje = plt.subplots(figsize=(10, 5))
+    eje.bar(corta.index, corta.values, width=0.8, color=COLORES["Cantidad_total"])
+    for valor, prob in corta.nlargest(3).items():
+        # Si la barra vecina es más alta, la etiqueta se corre hacia el lado contrario
+        # para no montarse sobre ella.
+        if corta.get(valor + 1, 0) > prob:
+            alineacion, desplazamiento = "right", 3
+        elif corta.get(valor - 1, 0) > prob:
+            alineacion, desplazamiento = "left", -3
+        else:
+            alineacion, desplazamiento = "center", 0
+        eje.annotate(f"{prob:.1%}", (valor, prob), xytext=(desplazamiento, 2),
+                     textcoords="offset points", ha=alineacion, va="bottom", fontsize=10)
+    eje.set_title("Función de masa de probabilidad de la cantidad total")
+    eje.set_xlabel(ETIQUETAS["Cantidad_total"])
+    eje.set_ylabel("Probabilidad P(X = x)")
+    eje.text(0.98, 0.95, f"Los valores hasta 40 unidades\nson el {corta.sum():.1%} de las ventas",
+             transform=eje.transAxes, ha="right", va="top", fontsize=10)
     fig.tight_layout()
     ruta = CARPETA_RESULTADOS / "pmf_Cantidad_total.png"
-    fig.savefig(ruta, dpi=150)
+    fig.savefig(ruta)
     plt.close(fig)
     print(f"Figura guardada: {ruta}")
     print(f"  Cantidad_total toma {len(pmf)} valores distintos; "
@@ -271,6 +362,8 @@ def ajustar_distribuciones(muestra):
     print("\n" + "=" * 78)
     print(f"AJUSTE DE DISTRIBUCIONES (muestra de {len(muestra):,} datos)")
     print("=" * 78)
+
+    mejores = {}  # variable -> (nombre, distribución, parámetros) del mejor ajuste
 
     for var in VARIABLES:
         x = muestra[var].to_numpy(dtype=float)
@@ -305,10 +398,41 @@ def ajustar_distribuciones(muestra):
             texto = ", ".join(f"{e} = {v:,.6g}" for e, v in zip(etiquetas, parametros))
             print(f"    {nombre}: {texto}")
 
+        mejor = tabla.loc[0, "Distribución"]
+        mejores[var] = (mejor, *parametros_ajustados[mejor])
+
+    return mejores
+
 
 # ----------------------------------------------------------------------------
 # 5. DEPENDENCIA ENTRE VARIABLES
 # ----------------------------------------------------------------------------
+def agrupar_en_deciles(serie, entera):
+    """
+    Agrupa una variable en hasta 10 grupos con la misma cantidad de datos (deciles)
+    y devuelve una variable categórica con etiquetas legibles, por ejemplo "10"
+    o "16–24" para variables enteras, y "66–200" para variables continuas.
+    """
+    codigos, bordes = pd.qcut(serie, q=10, labels=False, retbins=True, duplicates="drop")
+    n_grupos = len(bordes) - 1
+    etiquetas = []
+    for i in range(n_grupos):
+        inferior, superior = bordes[i], bordes[i + 1]
+        if entera:
+            # Los intervalos de qcut son (inferior, superior]; el primero incluye el mínimo
+            ini = int(np.ceil(inferior)) if i == 0 else int(np.floor(inferior)) + 1
+            fin = int(np.floor(superior))
+            if i == n_grupos - 1:
+                etiquetas.append(f"{ini}+")
+            elif ini == fin:
+                etiquetas.append(f"{ini}")
+            else:
+                etiquetas.append(f"{ini}–{fin}")
+        else:
+            etiquetas.append(f"{inferior:,.0f}–{superior:,.0f}")
+    return pd.Categorical.from_codes(codigos, categories=etiquetas, ordered=True)
+
+
 def analizar_dependencia(datos, muestra):
     """
     Analiza la relación entre Q = Cantidad_total y P = Precio_unitario.
@@ -359,10 +483,17 @@ def analizar_dependencia(datos, muestra):
 
     # ---- d) Prueba de independencia chi-cuadrado sobre una tabla de contingencia ----
     # Se agrupa cada variable en deciles para formar una tabla de contingencia.
-    q_bins = pd.qcut(datos["Cantidad_total"], q=10, duplicates="drop")
-    p_bins = pd.qcut(datos["Precio_unitario"], q=10, duplicates="drop")
-    tabla = pd.crosstab(q_bins, p_bins)
-    chi2, p_valor, grados, _ = stats.chi2_contingency(tabla)
+    q_grupos = agrupar_en_deciles(datos["Cantidad_total"], entera=True)
+    p_grupos = agrupar_en_deciles(datos["Precio_unitario"], entera=False)
+    q_etiquetas = list(q_grupos.categories)
+    p_etiquetas = list(p_grupos.categories)
+
+    tabla = pd.crosstab(
+        pd.Series(q_grupos, index=datos.index, name="Cantidad"),
+        pd.Series(p_grupos, index=datos.index, name="Precio"),
+    ).reindex(index=q_etiquetas, columns=p_etiquetas)
+
+    chi2, p_valor, grados, esperada = stats.chi2_contingency(tabla)
     n = tabla.to_numpy().sum()
     # V de Cramér: mide la fuerza de la asociación (0 = ninguna, 1 = total).
     # Con millones de datos el p-valor es siempre ínfimo, por eso se reporta V.
@@ -372,23 +503,21 @@ def analizar_dependencia(datos, muestra):
     print(f"   V de Cramér = {v_cramer:.4f}")
 
     # ---- e) Cómo cambia el precio según la cantidad ----
-    por_grupo = datos.groupby(q_bins, observed=True)["Precio_unitario"].agg(["count", "mean", "median"])
-    print("\ne) Precio_unitario según el decil de Cantidad_total")
+    por_grupo = (
+        pd.DataFrame({"grupo": q_grupos, "precio": datos["Precio_unitario"].to_numpy()})
+        .groupby("grupo", observed=True)["precio"].agg(["count", "mean", "median"])
+    )
+    print("\ne) Precio_unitario según el grupo de Cantidad_total")
     print(por_grupo.to_string(float_format=lambda v: f"{v:,.2f}"))
 
-    # ---- f) Gráfico de dispersión (muestra) ----
+    # ---- f) Razón entre frecuencia observada y esperada bajo independencia ----
+    razon = tabla / esperada
+    razon.to_csv(CARPETA_RESULTADOS / "dependencia_razon_observada_esperada.csv",
+                 float_format="%.4f")
+
     CARPETA_RESULTADOS.mkdir(exist_ok=True)
-    fig, eje = plt.subplots(figsize=(7, 5))
-    eje.hexbin(muestra["Cantidad_total"], muestra["Precio_unitario"],
-               gridsize=50, bins="log", xscale="log", yscale="log")
-    eje.set_title("Cantidad_total vs Precio_unitario (muestra, escala log)")
-    eje.set_xlabel("Cantidad_total")
-    eje.set_ylabel("Precio_unitario")
-    fig.tight_layout()
-    ruta = CARPETA_RESULTADOS / "dispersion_cantidad_precio.png"
-    fig.savefig(ruta, dpi=150)
-    plt.close(fig)
-    print(f"\nFigura guardada: {ruta}")
+    graficar_mapa_calor(razon)
+    graficar_cajas(datos, q_grupos, q_etiquetas)
 
     # Se guarda un CSV con los resultados numéricos para el reporte
     pd.DataFrame({
@@ -399,10 +528,82 @@ def analizar_dependencia(datos, muestra):
     }).to_csv(CARPETA_RESULTADOS / "dependencia.csv", index=False, float_format="%.6f")
 
 
+def graficar_mapa_calor(razon):
+    """
+    Mapa de calor de la razón (frecuencia observada / frecuencia esperada si Q y P
+    fueran independientes). Un valor de 1 indica independencia; mayor a 1 indica
+    que esa combinación ocurre más de lo esperado, y menor a 1, que ocurre menos.
+    """
+    valores = razon.to_numpy()
+    norma = TwoSlopeNorm(vcenter=1.0, vmin=min(valores.min(), 0.5),
+                         vmax=max(valores.max(), 1.5))
+
+    fig, eje = plt.subplots(figsize=(12, 6.5))
+    imagen = eje.imshow(valores, cmap="RdBu_r", norm=norma, aspect="auto")
+    eje.grid(False)
+
+    eje.set_xticks(range(valores.shape[1]))
+    eje.set_xticklabels(razon.columns, rotation=45, ha="right")
+    eje.set_yticks(range(valores.shape[0]))
+    eje.set_yticklabels(razon.index)
+    eje.set_xlabel("Grupo de precio unitario (deciles)")
+    eje.set_ylabel("Grupo de cantidad total (unidades)")
+    eje.set_title("Dependencia entre cantidad y precio\n"
+                  "Frecuencia observada / frecuencia esperada si fueran independientes")
+
+    for i in range(valores.shape[0]):
+        for j in range(valores.shape[1]):
+            intensidad = norma(valores[i, j])
+            color_texto = "white" if intensidad < 0.2 or intensidad > 0.8 else "black"
+            eje.text(j, i, f"{valores[i, j]:.2f}", ha="center", va="center",
+                     fontsize=9, color=color_texto)
+
+    barra = fig.colorbar(imagen, ax=eje)
+    barra.set_label("Razón observada / esperada (1 = independencia)")
+    fig.tight_layout()
+    ruta = CARPETA_RESULTADOS / "dependencia_mapa_calor.png"
+    fig.savefig(ruta)
+    plt.close(fig)
+    print(f"\nFigura guardada: {ruta}")
+
+
+def graficar_cajas(datos, q_grupos, q_etiquetas):
+    """Diagrama de cajas del precio unitario para cada grupo de cantidad total."""
+    precio = datos["Precio_unitario"].to_numpy(dtype=float)
+    codigos = np.asarray(q_grupos.codes)
+    grupos = [precio[codigos == i] for i in range(len(q_etiquetas))]
+    posiciones = np.arange(1, len(q_etiquetas) + 1)
+
+    fig, eje = plt.subplots(figsize=(11, 6))
+    eje.boxplot(grupos, whis=(5, 95), showfliers=False, patch_artist=True,
+                boxprops={"facecolor": COLORES["Precio_unitario"], "alpha": 0.55},
+                medianprops={"color": COLOR_KDE, "linewidth": 2})
+    eje.plot(posiciones, [g.mean() for g in grupos], "D", color=COLOR_AJUSTE,
+             markersize=7, label="Media")
+    eje.set_yscale("log")
+    eje.set_xticks(posiciones)
+    eje.set_xticklabels(q_etiquetas)
+    eje.set_xlabel("Grupo de cantidad total (unidades)")
+    eje.set_ylabel("Precio unitario (escala logarítmica)")
+    eje.set_title("Precio unitario según el grupo de cantidad total")
+    eje.legend(loc="upper right")
+    fig.text(0.01, -0.01,
+             "La caja abarca del percentil 25 al 75; la línea es la mediana; "
+             "los bigotes llegan a los percentiles 5 y 95.",
+             fontsize=9, color="dimgray")
+    fig.tight_layout()
+    ruta = CARPETA_RESULTADOS / "dependencia_cajas.png"
+    fig.savefig(ruta)
+    plt.close(fig)
+    print(f"Figura guardada: {ruta}")
+
+
 # ----------------------------------------------------------------------------
 # PROGRAMA PRINCIPAL
 # ----------------------------------------------------------------------------
 def main():
+    configurar_estilo()
+
     # 1) Preparación de las variables
     motor = crear_motor()
     try:
@@ -419,14 +620,14 @@ def main():
     CARPETA_RESULTADOS.mkdir(exist_ok=True)
     tabla.to_csv(CARPETA_RESULTADOS / "estadisticos.csv", float_format="%.6f")
 
-    # 3) Función de densidad
-    print("\n" + "=" * 78)
-    print("FUNCIÓN DE DENSIDAD")
-    print("=" * 78)
-    graficar_densidad(datos, muestra)
+    # 3) Ajuste de distribuciones teóricas
+    ajustes = ajustar_distribuciones(muestra)
 
-    # 4) Ajuste de distribuciones teóricas
-    ajustar_distribuciones(muestra)
+    # 4) Función de densidad (histograma, KDE y mejor ajuste teórico)
+    print("\n" + "=" * 78)
+    print("FIGURAS DE LA FUNCIÓN DE DENSIDAD")
+    print("=" * 78)
+    graficar_densidad(datos, muestra, ajustes)
 
     # 5) Dependencia entre Cantidad_total y Precio_unitario
     analizar_dependencia(datos, muestra)
