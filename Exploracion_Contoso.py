@@ -1,6 +1,4 @@
 """
-Proyecto 01 - Principios de Análisis de Datos (Contoso Sales)
-Modelos Probabilísticos de Señales y Sistemas - II-2026
 
 Parte 1: Análisis preliminar de los datos (exploración de la estructura de cada tabla).
 
